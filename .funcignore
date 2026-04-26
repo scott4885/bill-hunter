@@ -1,0 +1,14 @@
+.git*
+.vscode
+local.settings.json
+local.settings.json.example
+.env
+.env.example
+test
+tsconfig.json
+*.ts
+.gitignore
+node_modules
+dist/test
+README.md
+scripts

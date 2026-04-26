@@ -1,0 +1,16 @@
+node_modules
+dist
+.env
+.env.example
+.env.*
+local.settings.json
+local.settings.json.example
+.git
+.gitignore
+.funcignore
+.vscode
+*.log
+.DS_Store
+README.md
+infra/
+host.json
