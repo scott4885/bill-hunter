@@ -74,6 +74,23 @@ async function processNotification(n: GraphNotification, ctx: InvocationContext)
     classifyForTax(email, rawAttachments),
   ]);
 
+  if (billResult.status === 'rejected') {
+    ctx.error('extractBill failed', billResult.reason);
+  }
+  if (taxResult.status === 'rejected') {
+    ctx.error('classifyForTax failed', taxResult.reason);
+  }
+  if (billResult.status === 'fulfilled') {
+    ctx.log(
+      `bill: is_bill=${billResult.value.is_bill} vendor=${billResult.value.vendor} amount=${billResult.value.amount} confidence=${billResult.value.confidence}`,
+    );
+  }
+  if (taxResult.status === 'fulfilled') {
+    ctx.log(
+      `tax: is_tax_relevant=${taxResult.value.is_tax_relevant} vendor=${taxResult.value.vendor} amount=${taxResult.value.amount}`,
+    );
+  }
+
   // Bill Hunter
   if (billResult.status === 'fulfilled' && billResult.value.is_bill) {
     const ext = billResult.value;
