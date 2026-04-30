@@ -1,31 +1,34 @@
 /**
- * Express + node-cron entrypoint for self-hosted deploy (Coolify, Docker, etc).
+ * Express entrypoint for the Paperclip-orchestrated deploy.
  *
- * Mirrors the Azure Functions v4 setup:
- *   - HTTP webhook on POST /api/webhook (Graph notifications)
- *   - Daily timer: subscription renewal (06:00 UTC)
- *   - Daily timer: reconciliation (07:30 UTC)
- *   - Daily timer: Discord summary (13:00 UTC)
- *   - Periodic: scan statements inbox (every 15 min)
- *   - Periodic: scan rentals inbox (every 30 min)
+ * No internal scheduler — all cadence is owned by Paperclip's http adapter,
+ * which posts to the /jobs/* routes below on a per-agent intervalSec.
  *
- * Azure registrations in handlers/*.ts are gated behind FUNCTIONS_WORKER_RUNTIME
- * so importing them here is a no-op for the SDK; we wire Express + cron ourselves.
+ * Routes:
+ *   GET  /healthz             — unauthenticated liveness
+ *   POST /jobs/poll-mail      — Graph poll → Bill Hunter + Tax Archivist
+ *   POST /jobs/statements     — OneDrive statements/inbox sweep
+ *   POST /jobs/rentals        — OneDrive rentals/inbox sweep
+ *   POST /jobs/daily-tick     — hourly heartbeat → reconcile (07 UTC) + summary (13 UTC)
+ *
+ * All /jobs/* routes require `Authorization: Bearer ${BH_JOB_TOKEN}`.
  */
 
 import 'dotenv/config';
 import express from 'express';
-import cron from 'node-cron';
-import type { HttpRequest, HttpResponseInit, InvocationContext, Timer } from '@azure/functions';
+import type { InvocationContext, Timer } from '@azure/functions';
 
-import { webhookHandler } from './handlers/webhook';
-import { summaryHandler } from './handlers/summary';
 import { statementsHandler } from './handlers/statements';
 import { rentalsHandler } from './handlers/rentals';
-import { reconcileHandler } from './handlers/reconcile';
-import { renewHandler } from './handlers/renew';
+import { pollMailHandler } from './handlers/poll-mail';
+import { dailyTickHandler } from './handlers/daily-tick';
 
 const PORT = Number(process.env.PORT || 8080);
+const JOB_TOKEN = process.env.BH_JOB_TOKEN;
+if (!JOB_TOKEN) {
+  console.error('BH_JOB_TOKEN is required');
+  process.exit(1);
+}
 
 function makeCtx(name: string): InvocationContext {
   const prefix = `[${name}]`;
@@ -59,68 +62,59 @@ function fakeTimer(): Timer {
   } as Timer;
 }
 
-const httpApp = express();
-httpApp.use(express.json({ limit: '20mb' }));
+const app = express();
+app.use(express.json({ limit: '20mb' }));
 
-httpApp.get('/healthz', (_req, res) => {
+app.get('/healthz', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-httpApp.all('/api/webhook', async (req, res) => {
-  const ctx = makeCtx('webhook');
-  const fullUrl = `https://${req.headers.host ?? 'localhost'}${req.originalUrl}`;
-  const httpReq = {
-    url: fullUrl,
-    method: req.method,
-    headers: req.headers,
-    json: async () => req.body,
-  } as unknown as HttpRequest;
-
-  try {
-    const result: HttpResponseInit = await webhookHandler(httpReq, ctx);
-    res.status(result.status ?? 200);
-    if (result.headers) {
-      for (const [k, v] of Object.entries(result.headers)) {
-        res.setHeader(k, v as string);
-      }
-    }
-    res.send(result.body ?? '');
-  } catch (err) {
-    console.error('[webhook] crash', err);
-    res.status(500).send('internal error');
+function requireBearer(req: express.Request, res: express.Response): boolean {
+  const header = req.header('authorization') || '';
+  const expected = `Bearer ${JOB_TOKEN}`;
+  if (header !== expected) {
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
   }
-});
-
-interface CronJob {
-  name: string;
-  expr: string; // 5-field node-cron syntax (Azure has 6, dropped seconds)
-  fn: (t: Timer, c: InvocationContext) => Promise<void>;
+  return true;
 }
 
-const JOBS: CronJob[] = [
-  { name: 'renewSubscriptions', expr: '0 6 * * *', fn: renewHandler },
-  { name: 'reconcile', expr: '30 7 * * *', fn: reconcileHandler },
-  { name: 'dailySummary', expr: '0 13 * * *', fn: summaryHandler },
-  { name: 'processStatements', expr: '*/15 * * * *', fn: statementsHandler },
-  { name: 'processRentals', expr: '*/30 * * * *', fn: rentalsHandler },
-];
+type JobName = 'pollMail' | 'statements' | 'rentals' | 'dailyTick';
 
-for (const job of JOBS) {
-  cron.schedule(
-    job.expr,
-    async () => {
-      const ctx = makeCtx(job.name);
-      try {
-        await job.fn(fakeTimer(), ctx);
-      } catch (err) {
-        console.error(`[${job.name}] crash`, err);
-      }
-    },
-    { timezone: 'UTC' },
-  );
-  console.log(`scheduled ${job.name}: ${job.expr} UTC`);
+async function runJob(name: JobName): Promise<unknown> {
+  const ctx = makeCtx(name);
+  switch (name) {
+    case 'pollMail':
+      return pollMailHandler(ctx);
+    case 'statements':
+      await statementsHandler(fakeTimer(), ctx);
+      return { ok: true };
+    case 'rentals':
+      await rentalsHandler(fakeTimer(), ctx);
+      return { ok: true };
+    case 'dailyTick':
+      return dailyTickHandler(ctx);
+  }
 }
 
-httpApp.listen(PORT, () => {
-  console.log(`bill-hunter listening on :${PORT}`);
+function mountJob(path: string, name: JobName): void {
+  app.post(path, async (req, res) => {
+    if (!requireBearer(req, res)) return;
+    try {
+      const result = await runJob(name);
+      res.json({ job: name, result });
+    } catch (err) {
+      console.error(`[${name}] crash`, err);
+      res.status(500).json({ job: name, error: String(err) });
+    }
+  });
+}
+
+mountJob('/jobs/poll-mail', 'pollMail');
+mountJob('/jobs/statements', 'statements');
+mountJob('/jobs/rentals', 'rentals');
+mountJob('/jobs/daily-tick', 'dailyTick');
+
+app.listen(PORT, () => {
+  console.log(`bill-hunter listening on :${PORT} (${Object.keys({ pollMail: 0, statements: 0, rentals: 0, dailyTick: 0 }).join(', ')})`);
 });

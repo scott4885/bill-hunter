@@ -1,85 +1,44 @@
 /**
- * Azure Function HTTP trigger for Microsoft Graph webhook notifications.
+ * Run Bill Hunter + Tax Archivist on a single Graph message id.
  *
- * Graph sends a POST with notifications when emails arrive in the inbox.
- * The handshake (validationToken) must be acknowledged within 10 seconds.
- *
- * Subscription resource: me/mailFolders('inbox')/messages
- * Change types: created
+ * Extracted from the deprecated webhook handler so both push (legacy) and
+ * poll (Paperclip-driven) entrypoints share one implementation.
  */
 
-import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
+import type { InvocationContext } from '@azure/functions';
 import { getMessage, getAttachments } from '../graph/client';
 import { extractBill, buildInvoiceId } from '../agents/bill-hunter';
 import { classifyForTax } from '../agents/tax-archivist';
-import { appendBillRow, appendTaxRow, billExists, uploadAttachment } from '../graph/excel';
+import {
+  appendBillRow,
+  appendTaxRow,
+  billExists,
+  uploadAttachment,
+} from '../graph/excel';
 
-interface GraphNotification {
-  subscriptionId: string;
-  clientState?: string;
-  changeType: string;
-  resource: string; // e.g. "Users/{id}/Messages/{messageId}"
-  resourceData: { id: string; '@odata.type': string };
-  tenantId: string;
+export interface ProcessResult {
+  messageId: string;
+  receivedDateTime: string;
+  billLogged: boolean;
+  taxLogged: boolean;
+  duplicate: boolean;
 }
 
-export async function webhookHandler(
-  req: HttpRequest,
+export async function processMessage(
+  messageId: string,
   ctx: InvocationContext,
-): Promise<HttpResponseInit> {
-  // Handshake: Graph appends ?validationToken=... on subscription creation
-  const url = new URL(req.url);
-  const validationToken = url.searchParams.get('validationToken');
-  if (validationToken) {
-    return {
-      status: 200,
-      headers: { 'Content-Type': 'text/plain' },
-      body: validationToken,
-    };
-  }
-
-  // Real notification
-  const body = (await req.json()) as { value: GraphNotification[] };
-  const expectedClientState = process.env.WEBHOOK_CLIENT_STATE_SECRET;
-
-  // ACK quickly; do work async via setImmediate so we return 202 within 10s.
-  setImmediate(async () => {
-    for (const notification of body.value || []) {
-      try {
-        if (notification.clientState !== expectedClientState) {
-          ctx.warn(`Bad clientState on notification ${notification.subscriptionId}`);
-          continue;
-        }
-        await processNotification(notification, ctx);
-      } catch (err) {
-        ctx.error('Notification processing failed', err);
-      }
-    }
-  });
-
-  return { status: 202 };
-}
-
-async function processNotification(n: GraphNotification, ctx: InvocationContext) {
-  if (n.changeType !== 'created') return;
-  const messageId = n.resourceData.id;
-  ctx.log(`Processing message ${messageId}`);
-
+): Promise<ProcessResult> {
   const email = await getMessage(messageId);
   const rawAttachments = email.hasAttachments ? await getAttachments(messageId) : [];
 
-  // Run both agents in parallel.
   const [billResult, taxResult] = await Promise.allSettled([
     extractBill(email, rawAttachments),
     classifyForTax(email, rawAttachments),
   ]);
 
-  if (billResult.status === 'rejected') {
-    ctx.error('extractBill failed', billResult.reason);
-  }
-  if (taxResult.status === 'rejected') {
-    ctx.error('classifyForTax failed', taxResult.reason);
-  }
+  if (billResult.status === 'rejected') ctx.error('extractBill failed', billResult.reason);
+  if (taxResult.status === 'rejected') ctx.error('classifyForTax failed', taxResult.reason);
+
   if (billResult.status === 'fulfilled') {
     ctx.log(
       `bill: is_bill=${billResult.value.is_bill} vendor=${billResult.value.vendor} amount=${billResult.value.amount} confidence=${billResult.value.confidence}`,
@@ -91,15 +50,17 @@ async function processNotification(n: GraphNotification, ctx: InvocationContext)
     );
   }
 
-  // Bill Hunter
+  let billLogged = false;
+  let duplicate = false;
+
   if (billResult.status === 'fulfilled' && billResult.value.is_bill) {
     const ext = billResult.value;
     const invoiceId = buildInvoiceId(ext, email);
 
     if (await billExists(invoiceId)) {
       ctx.log(`Skipping duplicate bill ${invoiceId}`);
+      duplicate = true;
     } else {
-      // Save attachments to OneDrive for the record
       const attachmentPaths: string[] = [];
       for (const att of rawAttachments) {
         if (att.contentBytes && att.contentType === 'application/pdf') {
@@ -123,10 +84,11 @@ async function processNotification(n: GraphNotification, ctx: InvocationContext)
         notes: `${ext.reasoning}${ext.flags.length ? ` | flags: ${ext.flags.join(',')}` : ''}`,
       });
       ctx.log(`Logged bill ${invoiceId} from ${ext.vendor} for $${ext.amount}`);
+      billLogged = true;
     }
   }
 
-  // Tax Archivist
+  let taxLogged = false;
   if (taxResult.status === 'fulfilled' && taxResult.value.is_tax_relevant) {
     const tax = taxResult.value;
     const txDate = tax.date ?? email.receivedDateTime.slice(0, 10);
@@ -155,13 +117,14 @@ async function processNotification(n: GraphNotification, ctx: InvocationContext)
       notes: tax.flags.join(','),
     });
     ctx.log(`Tax-logged ${tax.vendor} (${tax.schedule_c_category}, ${tax.entity})`);
+    taxLogged = true;
   }
-}
 
-if (process.env.FUNCTIONS_WORKER_RUNTIME) {
-  app.http('webhook', {
-    methods: ['POST', 'GET'],
-    authLevel: 'anonymous', // Graph posts here; security via clientState
-    handler: webhookHandler,
-  });
+  return {
+    messageId,
+    receivedDateTime: email.receivedDateTime,
+    billLogged,
+    taxLogged,
+    duplicate,
+  };
 }
