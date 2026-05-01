@@ -41,7 +41,12 @@ async function loadState(): Promise<CursorState> {
     };
   } catch (err: any) {
     if (err?.code !== 'ENOENT') throw err;
-    return { lastSeenIso: bootstrapTs(), recentIds: [] };
+    // First-run bootstrap: persist immediately so subsequent ticks have a
+    // stable cursor. Without this, every empty-result tick re-bootstraps to
+    // "now" and any mail arriving between ticks slips past the gt filter.
+    const fresh: CursorState = { lastSeenIso: bootstrapTs(), recentIds: [] };
+    await saveState(fresh);
+    return fresh;
   }
 }
 
